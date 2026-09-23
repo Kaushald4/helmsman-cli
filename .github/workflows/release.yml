@@ -1,0 +1,121 @@
+name: Release
+
+# Publishes a runnable helmsman bundle as a GitHub release asset, which the Pulse
+# desktop app downloads and installs.
+#
+# tsup keeps dependencies external, so `dist/` alone cannot run - the published
+# archive also carries production node_modules.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish under, e.g. v0.1.0 (created if missing)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve tag and asset name
+        id: meta
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            TAG="${DISPATCH_TAG}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          if [ -z "${TAG}" ]; then
+            echo "::error::No tag resolved."
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          {
+            echo "tag=${TAG}"
+            echo "version=${VERSION}"
+            echo "asset=helmsman-cli-${VERSION}.tar.gz"
+          } >> "${GITHUB_OUTPUT}"
+          echo "Publishing ${TAG} (version ${VERSION})"
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Test
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build
+
+      - name: Verify dist output
+        run: |
+          set -euo pipefail
+          test -f dist/cli.js || { echo "::error::dist/cli.js was not produced"; exit 1; }
+          test -f dist/index.js || { echo "::error::dist/index.js was not produced"; exit 1; }
+
+      - name: Assemble runnable bundle
+        run: |
+          set -euo pipefail
+          rm -rf release
+          mkdir -p release/helmsman
+          cp -R dist release/helmsman/dist
+          cp package.json release/helmsman/package.json
+          cd release/helmsman
+          # Dependencies are external to the tsup output, so bundle them for real.
+          npm install --omit=dev --ignore-scripts --no-audit --no-fund --no-package-lock
+          rm -f package-lock.json
+
+      - name: Smoke-test the bundle
+        run: |
+          set -euo pipefail
+          node release/helmsman/dist/cli.js --version
+          node -e "import('./release/helmsman/dist/index.js').then(() => console.log('index.js loads'))"
+
+      - name: Create archive
+        run: |
+          set -euo pipefail
+          tar -C release -czf "${{ steps.meta.outputs.asset }}" helmsman
+          ls -lh "${{ steps.meta.outputs.asset }}"
+
+      - name: Publish release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          ASSET: ${{ steps.meta.outputs.asset }}
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} exists - replacing the asset."
+            gh release upload "${TAG}" "${ASSET}" --clobber
+          else
+            echo "Creating release ${TAG}."
+            gh release create "${TAG}" "${ASSET}" \
+              --title "${TAG}" \
+              --generate-notes
+          fi
+          echo "### Published \`${ASSET}\` under \`${TAG}\`" >> "${GITHUB_STEP_SUMMARY}"
